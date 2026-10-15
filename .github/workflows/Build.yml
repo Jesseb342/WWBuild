@@ -1,4 +1,12 @@
-name: Build Wind Waker Recomp IPA
+name: Build SquirrelPad IPA
+
+# Same structure as the working "Build BlueWake IPA" workflow:
+# whole checkout cached in RUNNER_TEMP, restored by the newest "sq-build-" key,
+# build stopped by a time-limit watchdog, cache saved with always().
+# Keep this repo PRIVATE: the cache and IPA contain code translated from your ROM.
+#
+# Run it with minutes=15 first as a test, then with 320 for real, and run it
+# again after each stop until it says "Build finished successfully".
 
 on:
   workflow_dispatch:
@@ -13,6 +21,9 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 360
 
+    env:
+      ROM_DRIVE_ID: "1ZgP1dSW_YGs5EGy-55a0JI-I3-BPw0qR"
+
     steps:
       - name: Show runner information
         run: |
@@ -20,77 +31,71 @@ jobs:
           sysctl -n hw.ncpu
           sysctl -n machdep.cpu.brand_string
           sysctl -n hw.memsize
+          xcodebuild -version
           df -h /
 
-      - name: Download Wind Waker CISO
-        env:
-          WIND_WAKER_URL: https://drive.usercontent.google.com/download?id=1hXBvvzcUEOYe5NHJKiPpm14TYfnKTEEf&export=download&confirm=t
+      - name: Download Conker ROM from Google Drive
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/wind-waker"
-          cd "$RUNNER_TEMP/wind-waker"
-          curl -L --fail --retry 3 --retry-all-errors \
-            -A "Mozilla/5.0" \
-            -o "test build.ciso" \
-            "$WIND_WAKER_URL"
-          ls -lh "test build.ciso"
-          file "test build.ciso"
+          mkdir -p "$RUNNER_TEMP/conker"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet gdown
+          ROM="$RUNNER_TEMP/conker/conker-us.z64"
+          for i in 1 2 3 4; do
+            rm -f "$ROM"
+            if "$RUNNER_TEMP/venv/bin/gdown" \
+                 "https://drive.google.com/uc?id=$ROM_DRIVE_ID" -O "$ROM" \
+               && [ "$(stat -f%z "$ROM")" = "67108864" ]; then
+              break
+            fi
+            echo "Download attempt $i failed; retrying in $((i*30))s"
+            sleep $((i*30))
+          done
+          ls -lh "$ROM"
+          test "$(stat -f%z "$ROM")" = "67108864"
+          test "$(xxd -l 4 -p "$ROM")" = "80371240"
+          test "$(shasum -a 1 "$ROM" | cut -d' ' -f1)" = "4cbadd3c4e0729dec46af64ad018050eada4f47a"
+          echo "ROM verified"
 
-      - name: Download Wiimms ISO Tools
+      - name: Install build tools
         run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/wind-waker"
-          curl -L --fail --retry 3 --retry-all-errors \
-            -o wit.tar.gz \
-            "https://wit.wiimm.de/download/wit-v3.05a-r8638-mac.tar.gz"
-          tar -xzf wit.tar.gz
-          WIT_DIR="$(find . -maxdepth 1 -type d -name 'wit-*' -print -quit)"
-          if [ -z "$WIT_DIR" ]; then
-            echo "::error::Wiimms ISO Tools directory was not found."
-            exit 1
-          fi
-          chmod +x "$WIT_DIR/bin/wit"
-          "$WIT_DIR/bin/wit" --version
-
-      - name: Convert CISO to ISO
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/wind-waker"
-          WIT_DIR="$(find . -maxdepth 1 -type d -name 'wit-*' -print -quit)"
-          "$WIT_DIR/bin/wit" FILES "test build.ciso"
-          "$WIT_DIR/bin/wit" copy \
-            "test build.ciso" \
-            --iso \
-            -d WindWaker.iso
-          ls -lh WindWaker.iso
-          file WindWaker.iso
+          brew install cmake ninja pkgconf sdl2 freetype ripgrep || true
+          xcodebuild -downloadComponent MetalToolchain || true
+          cmake --version
+          ninja --version
+          rg --version | head -1
 
       - name: Restore build cache
         id: cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/wind-waker-recomp
-          key: ww-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/squirrelpad
+          key: sq-build-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ww-build-
+            sq-build-
 
       - name: Cache status
         run: |
           echo "Exact hit: ${{ steps.cache.outputs.cache-hit }}"
           echo "Matched key: '${{ steps.cache.outputs.cache-matched-key }}'"
-          if [ -d "$RUNNER_TEMP/wind-waker-recomp" ]; then
-            du -sh "$RUNNER_TEMP/wind-waker-recomp"
+          if [ -d "$RUNNER_TEMP/squirrelpad" ]; then
+            du -sh "$RUNNER_TEMP/squirrelpad"
           else
             echo "No restored folder (fresh start)"
           fi
 
-      - name: Clone Wind Waker Recomp
-        if: steps.cache.outputs.cache-matched-key == ''
+      - name: Clone SquirrelPad
+        if: ${{ steps.cache.outputs.cache-matched-key == '' }}
         run: |
           set -euo pipefail
-          git clone --depth 1 \
-            https://github.com/elliotttate/Wind-Waker-Recomp.git \
-            "$RUNNER_TEMP/wind-waker-recomp"
+          git clone https://github.com/chrissotraidis/squirrelpad.git \
+            "$RUNNER_TEMP/squirrelpad"
+
+      - name: Show SquirrelPad commit and builder options
+        run: |
+          cd "$RUNNER_TEMP/squirrelpad"
+          git log -1 --format='%H %s'
+          python3 scripts/build-personal.py --help || true
 
       - name: Build IPA (with watchdog)
         id: build
@@ -98,19 +103,16 @@ jobs:
           LIMIT_MIN: ${{ inputs.minutes }}
         run: |
           set -u
-          set -m   # job control: background jobs get their own process group
+          set -m
 
-          cd "$RUNNER_TEMP/wind-waker-recomp"
-          chmod +x scripts/builder/build.sh
+          cd "$RUNNER_TEMP/squirrelpad"
+
           LIMIT=$(( LIMIT_MIN * 60 ))
           echo "Watchdog limit: ${LIMIT_MIN} minutes"
 
-          ./scripts/builder/build.sh \
-            "$RUNNER_TEMP/wind-waker/WindWaker.iso" \
-            --ipa "$RUNNER_TEMP/BlueWake.ipa" \
-            --jobs 3 \
-            --no-mods \
-            --no-train &
+          python3 scripts/build-personal.py \
+            --rom "$RUNNER_TEMP/conker/conker-us.z64" \
+            --output "$RUNNER_TEMP/SquirrelPad.ipa" &
           BUILD_PID=$!
 
           (
@@ -119,13 +121,23 @@ jobs:
             kill -TERM -- -"$BUILD_PID" 2>/dev/null
             sleep 20
             kill -KILL -- -"$BUILD_PID" 2>/dev/null
-            pkill -KILL -x xcodebuild clang clang++ ninja make 2>/dev/null
+            for p in xcodebuild clang clang++ ninja make metal; do
+              pkill -KILL -x "$p" 2>/dev/null
+            done
           ) &
           WATCHDOG_PID=$!
 
+          (
+            while true; do
+              sleep 300
+              echo "[heartbeat] $(date '+%H:%M:%S') | disk free: $(df -h / | awk 'NR==2{print $4}') | load: $(uptime | sed 's/.*load averages*: //')"
+            done
+          ) &
+          HEARTBEAT_PID=$!
+
           wait "$BUILD_PID"
           RC=$?
-          kill "$WATCHDOG_PID" 2>/dev/null
+          kill "$WATCHDOG_PID" "$HEARTBEAT_PID" 2>/dev/null
 
           if [ "$RC" -eq 0 ]; then
             echo "Build finished successfully"
@@ -137,25 +149,29 @@ jobs:
           exit 0
 
       - name: Save build cache
-        if: always()
+        if: ${{ always() }}
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/wind-waker-recomp
-          key: ww-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/squirrelpad
+          key: sq-build-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Check IPA
         if: steps.build.outputs.done == 'true'
         run: |
-          ls -lh "$RUNNER_TEMP/BlueWake.ipa"
-          file "$RUNNER_TEMP/BlueWake.ipa"
+          ls -lh "$RUNNER_TEMP/SquirrelPad.ipa"
+          file "$RUNNER_TEMP/SquirrelPad.ipa"
+          unzip -l "$RUNNER_TEMP/SquirrelPad.ipa" | head -20
           df -h /
 
       - name: Upload IPA
         if: steps.build.outputs.done == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: BlueWake-iOS
-          path: ${{ runner.temp }}/BlueWake.ipa
+          name: SquirrelPad-iOS
+          path: ${{ runner.temp }}/SquirrelPad.ipa
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
+      - name: Remove ROM
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/conker/conker-us.z64"
